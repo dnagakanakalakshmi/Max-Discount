@@ -2,7 +2,7 @@
 
 client_id = "43321f053a453467f522b191a74c7116"
 name = "Max Discount"
-application_url = "https://example.com"
+application_url = "https://bulk-discount-generation.onrender.com"
 embedded = true
 
 [build]
@@ -24,7 +24,7 @@ api_version = "2026-07"
 scopes = "read_discounts,write_discounts,write_products,read_customers"
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://bulk-discount-generation.onrender.com/api/auth" ]
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
