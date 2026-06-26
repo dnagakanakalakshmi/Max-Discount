@@ -1,0 +1,58 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "cost": {
+          "subtotalAmount": {
+            "amount": "500.00",
+            "currencyCode": "INR"
+          }
+        },
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/1"
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": ["ORDER"],
+        "metafield": {
+          "jsonValue": {
+            "title": "150 off up to 100",
+            "discountType": "fixed",
+            "discountValue": 150,
+            "maxDiscountAmount": 100
+          }
+        }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "orderDiscountsAdd": {
+            "candidates": [
+              {
+                "message": "150 off up to 100 (applied INR 100)",
+                "targets": [
+                  {
+                    "orderSubtotal": {
+                      "excludedCartLineIds": []
+                    }
+                  }
+                ],
+                "value": {
+                  "fixedAmount": {
+                    "amount": "100.00"
+                  }
+                }
+              }
+            ],
+            "selectionStrategy": "MAXIMUM"
+          }
+        }
+      ]
+    }
+  }
+}

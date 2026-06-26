@@ -1,0 +1,28 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "cost": {
+          "subtotalAmount": {
+            "amount": "1000.00",
+            "currencyCode": "INR"
+          }
+        },
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/1"
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": [],
+        "metafield": null
+      }
+    },
+    "output": {
+      "operations": []
+    }
+  }
+}

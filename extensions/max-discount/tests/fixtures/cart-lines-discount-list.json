@@ -1,0 +1,83 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "cost": {
+          "subtotalAmount": {
+            "amount": "2000.00",
+            "currencyCode": "INR"
+          }
+        },
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/1"
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": ["ORDER"],
+        "metafield": {
+          "jsonValue": {
+            "discounts": [
+              {
+                "title": "10% off up to 100",
+                "discountType": "percentage",
+                "discountValue": 10,
+                "maxDiscountAmount": 100
+              },
+              {
+                "title": "5% off up to 60",
+                "discountType": "percentage",
+                "discountValue": 5,
+                "maxDiscountAmount": 60
+              }
+            ]
+          }
+        }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "orderDiscountsAdd": {
+            "candidates": [
+              {
+                "message": "10% off up to 100 (applied INR 100)",
+                "targets": [
+                  {
+                    "orderSubtotal": {
+                      "excludedCartLineIds": []
+                    }
+                  }
+                ],
+                "value": {
+                  "fixedAmount": {
+                    "amount": "100.00"
+                  }
+                }
+              },
+              {
+                "message": "5% off up to 60 (applied INR 60)",
+                "targets": [
+                  {
+                    "orderSubtotal": {
+                      "excludedCartLineIds": []
+                    }
+                  }
+                ],
+                "value": {
+                  "fixedAmount": {
+                    "amount": "60.00"
+                  }
+                }
+              }
+            ],
+            "selectionStrategy": "MAXIMUM"
+          }
+        }
+      ]
+    }
+  }
+}

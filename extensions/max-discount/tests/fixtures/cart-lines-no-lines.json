@@ -1,0 +1,31 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "cost": {
+          "subtotalAmount": {
+            "amount": "1000.00",
+            "currencyCode": "INR"
+          }
+        },
+        "lines": []
+      },
+      "discount": {
+        "discountClasses": ["ORDER"],
+        "metafield": {
+          "jsonValue": {
+            "title": "10% off up to 100",
+            "discountType": "percentage",
+            "discountValue": 10,
+            "maxDiscountAmount": 100
+          }
+        }
+      }
+    },
+    "output": {
+      "operations": []
+    }
+  }
+}

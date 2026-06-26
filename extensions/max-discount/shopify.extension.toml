@@ -1,0 +1,26 @@
+api_version = "2026-04"
+
+[[extensions]]
+name = "t:name"
+handle = "max-discount"
+type = "function"
+uid = "f7571050-90eb-cdb4-e8b8-3c565f904a2fadc539a0"
+description = "t:description"
+
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart-lines-discounts-generate-run"
+
+  [[extensions.targeting]]
+  target = "cart.delivery-options.discounts.generate.run"
+  input_query = "src/cart_delivery_options_discounts_generate_run.graphql"
+  export = "cart-delivery-options-discounts-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"
+
+  [extensions.input.variables]
+  namespace = "$app"
+  key = "collection-ids"
