@@ -5,10 +5,11 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate, unauthenticated } from "../shopify.server";
 import {
-  getBatchRecord,
-  addBatchRecord,
-  updateBatchRecord,
-} from "../models/bulkBatch.server";
+  startJob,
+  updateJobProgress,
+  completeJob,
+  failJob,
+} from "../models/bulkJobProgress.server";
 
 const CONFIG_NAMESPACE = "$app";
 const CONFIG_KEY = "config";
@@ -91,32 +92,15 @@ async function createNewBatch({ admin, formData, functionId, baseDiscount, shop 
   const batchId = generateBatchId();
   const couponCodes = generateUniqueCouponCodes(prefix, numberOfCoupons);
 
-  // Persist a placeholder batch record immediately so the list page and
-  // the polling loader have something to show right away.
-  await addBatchRecord(admin, {
-    batchId,
-    name: batchName,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    prefix,
-    count: 0,
-    discountIds: [],
-    template: { ...baseDiscount, functionId },
-    couponCodes,
-    nextIndex: 0,
-    progress: { status: "processing", completed: 0, total: numberOfCoupons, errors: [] },
-  });
+  startJob(batchId, numberOfCoupons);
 
-  // IMPORTANT: don't await this. Let it run after the response is sent.
-  // Remix/React Router won't cancel it just because the request finished,
-  // as long as the process itself stays alive (true on a normal Node
-  // server/Render — NOT on traditional serverless functions, which kill
-  // the process once the response is returned).
-  runBulkGeneration({ shop, batchId, couponCodes, baseDiscount, functionId, startIndex:0 }).catch((err) => {
-    console.error(`Bulk generation failed for batch ${batchId}:`, err);
-  });
+  runBulkGeneration({ shop, batchId, couponCodes, baseDiscount, functionId, batchName, prefix }).catch(
+    (err) => {
+      console.error(`Bulk generation failed for batch ${batchId}:`, err);
+      failJob(batchId, err?.message || "Unknown error during generation");
+    },
+  );
 
-  // Return immediately — well under any timeout.
   return {
     batchId,
     started: true,
@@ -128,65 +112,59 @@ async function createNewBatch({ admin, formData, functionId, baseDiscount, shop 
 const CONCURRENCY = 5; // tune this — see notes below
 
 
-async function runBulkGeneration({ shop, batchId, couponCodes, baseDiscount, functionId, startIndex = 0 }) {
+async function runBulkGeneration({ shop, batchId, couponCodes, baseDiscount, functionId, batchName, prefix }) {
   const { admin } = await unauthenticated.admin(shop);
 
-  // On a fresh run startIndex is 0, so these existing values are empty —
-  // on a resumed run, seed them from what's already persisted so progress
-  // accumulates correctly instead of overwriting.
-  const existingBatch = await getBatchRecord(admin, batchId);
-  const createdDiscounts = [];          // created in THIS run only
-  const errors = [...(existingBatch?.progress?.errors || [])];
+  const createdDiscounts = [];
+  const errors = [];
   const csvRows = [];
-  const priorDiscountIds = existingBatch?.discountIds || [];
 
-  for (let i = startIndex; i < couponCodes.length; i += CONCURRENCY) {
+  for (let i = 0; i < couponCodes.length; i += CONCURRENCY) {
     const chunk = couponCodes.slice(i, i + CONCURRENCY);
 
     const results = await Promise.allSettled(
-      chunk.map((code) => createSingleCoupon({ admin, code, baseDiscount, functionId }))
+      chunk.map((code) => createSingleCoupon({ admin, code, baseDiscount, functionId })),
     );
 
+    const newErrors = [];
     for (const result of results) {
       if (result.status === "fulfilled" && result.value.success) {
         createdDiscounts.push(result.value.created);
         csvRows.push(buildCsvRow(result.value.created));
       } else {
-        const message = result.status === "fulfilled"
-          ? result.value.error
-          : result.reason?.message || "Unknown error";
-        errors.push(message);
+        const message =
+          result.status === "fulfilled" ? result.value.error : result.reason?.message || "Unknown error";
+        newErrors.push(message);
       }
     }
+    errors.push(...newErrors);
 
-    const nextIndex = Math.min(i + CONCURRENCY, couponCodes.length);
-    const allDiscountIds = [...priorDiscountIds, ...createdDiscounts.map((d) => d.id)];
+    const completed = Math.min(i + CONCURRENCY, couponCodes.length);
 
-    await updateBatchRecord(admin, batchId, {
-      count: allDiscountIds.length,
-      discountIds: allDiscountIds,
-      nextIndex,
-      updatedAt: new Date().toISOString(),
-      progress: {
-        status: "processing",
-        completed: nextIndex,
-        total: couponCodes.length,
-        errors,
-      },
-    });
+    // Cheap in-memory update — replaces the old per-chunk updateBatchRecord() call.
+    updateJobProgress(batchId, { completed, newErrors });
   }
 
   const csvContent = generateCSV(csvRows);
-  const allDiscountIds = [...priorDiscountIds, ...createdDiscounts.map((d) => d.id)];
+  const allDiscountIds = createdDiscounts.map((d) => d.id);
 
-  await updateBatchRecord(admin, batchId, {
+  // The ONE metafield write for this entire job.
+  await addBatchRecord(admin, {
+    batchId,
+    name: batchName,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    prefix,
     count: allDiscountIds.length,
     discountIds: allDiscountIds,
+    template: { ...baseDiscount, functionId },
+    couponCodes,
     nextIndex: couponCodes.length,
-    updatedAt: new Date().toISOString(),
     progress: { status: "complete", completed: couponCodes.length, total: couponCodes.length, errors },
     lastCsvContent: csvContent,
   });
+
+  completeJob(batchId, { csvContent });
 }
 
 async function createSingleCoupon({ admin, code, baseDiscount, functionId }) {
