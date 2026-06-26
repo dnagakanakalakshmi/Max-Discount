@@ -9,7 +9,7 @@ generator client {
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = "file:dev.sqlite"
 }
 
