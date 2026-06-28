@@ -10,6 +10,11 @@ import {
   completeJob,
   failJob,
 } from "../models/bulkJobProgress.server";
+import {
+  getBatchRecord,
+  addBatchRecord,
+  updateBatchRecord,
+} from "../models/bulkBatch.server";
 
 const CONFIG_NAMESPACE = "$app";
 const CONFIG_KEY = "config";
