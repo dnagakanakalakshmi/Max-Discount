@@ -7,6 +7,7 @@ import { authenticate, unauthenticated } from "../shopify.server";
 import {
   startJob,
   updateJobProgress,
+  setJobCsv,
   completeJob,
   failJob,
 } from "../models/bulkJobProgress.server";
@@ -14,6 +15,7 @@ import {
   getBatchRecord,
   addBatchRecord,
   updateBatchRecord,
+  addRedeemCodesToMaster,
 } from "../models/bulkBatch.server";
 
 const CONFIG_NAMESPACE = "$app";
@@ -60,11 +62,34 @@ export const loader = async ({ request }) => {
   const batchId = url.searchParams.get("batchId");
   const editingBatch = batchId ? await getBatchRecord(admin, batchId) : null;
 
+  let editingCustomerLabels = [];
+  if (editingBatch?.template?.customerEligibility?.mode === "customers") {
+    const ids = editingBatch.template.customerEligibility.customerIds || [];
+    if (ids.length) {
+      const response = await admin.graphql(
+        `#graphql
+          query EditBatchCustomerLabels($ids: [ID!]!) {
+            nodes(ids: $ids) {
+              ... on Customer {
+                id
+                displayName
+                email
+              }
+            }
+          }`,
+        { variables: { ids } },
+      );
+      const json = await response.json();
+      editingCustomerLabels = (json.data?.nodes || []).filter(Boolean);
+    }
+  }
+
   return {
     functions,
     selectedFunctionId,
     segments,
     editingBatch,
+    editingCustomerLabels,
   };
 };
 
@@ -75,11 +100,10 @@ export const action = async ({ request }) => {
   const intent = formData.get("intent")?.toString() || "create";
   const functionId = requiredString(formData, "functionId");
 
-  // Parse the discount configuration once - it will be the same for all coupons
   const baseDiscount = parseBulkDiscountConfig(formData);
 
   if (intent === "update") {
-    return updateExistingBatch({ admin, formData, functionId, baseDiscount, shop: session.shop });
+    return updateExistingBatch({ admin, formData, functionId, baseDiscount });
   }
 
   return createNewBatch({ admin, formData, functionId, baseDiscount, shop: session.shop });
@@ -99,12 +123,39 @@ async function createNewBatch({ admin, formData, functionId, baseDiscount, shop 
 
   startJob(batchId, numberOfCoupons);
 
-  runBulkGeneration({ shop, batchId, couponCodes, baseDiscount, functionId, batchName, prefix }).catch(
-    (err) => {
-      console.error(`Bulk generation failed for batch ${batchId}:`, err);
-      failJob(batchId, err?.message || "Unknown error during generation");
-    },
-  );
+  const masterDiscountId = await createMasterDiscount({
+    admin,
+    seedCode: couponCodes[0],
+    baseDiscount,
+    functionId,
+    batchName,
+  });
+
+  runBulkGeneration({
+    shop,
+    batchId,
+    masterDiscountId,
+    couponCodes,
+    baseDiscount,
+    functionId,
+    batchName,
+    prefix,
+  }).catch(async (err) => {
+    // err may be a Response thrown by writeBatchRegistry or other helpers.
+    // Extract the real message so failJob/logs are actually useful.
+    let message = "Unknown error during generation";
+    if (err instanceof Response) {
+      try {
+        message = await err.text();
+      } catch {
+        message = `HTTP ${err.status} response (body unreadable)`;
+      }
+    } else if (err?.message) {
+      message = err.message;
+    }
+    console.error(`Bulk generation failed for batch ${batchId}:`, message);
+    failJob(batchId, message);
+  });
 
   return {
     batchId,
@@ -113,77 +164,14 @@ async function createNewBatch({ admin, formData, functionId, baseDiscount, shop 
   };
 }
 
-
-const CONCURRENCY = 5; // tune this — see notes below
-
-
-async function runBulkGeneration({ shop, batchId, couponCodes, baseDiscount, functionId, batchName, prefix }) {
-  const { admin } = await unauthenticated.admin(shop);
-
-  const createdDiscounts = [];
-  const errors = [];
-  const csvRows = [];
-
-  for (let i = 0; i < couponCodes.length; i += CONCURRENCY) {
-    const chunk = couponCodes.slice(i, i + CONCURRENCY);
-
-    const results = await Promise.allSettled(
-      chunk.map((code) => createSingleCoupon({ admin, code, baseDiscount, functionId })),
-    );
-
-    const newErrors = [];
-    for (const result of results) {
-      if (result.status === "fulfilled" && result.value.success) {
-        createdDiscounts.push(result.value.created);
-        csvRows.push(buildCsvRow(result.value.created));
-      } else {
-        const message =
-          result.status === "fulfilled" ? result.value.error : result.reason?.message || "Unknown error";
-        newErrors.push(message);
-      }
-    }
-    errors.push(...newErrors);
-
-    const completed = Math.min(i + CONCURRENCY, couponCodes.length);
-
-    // Cheap in-memory update — replaces the old per-chunk updateBatchRecord() call.
-    updateJobProgress(batchId, { completed, newErrors });
-  }
-
-  const csvContent = generateCSV(csvRows);
-  const allDiscountIds = createdDiscounts.map((d) => d.id);
-
-  // The ONE metafield write for this entire job.
-  await addBatchRecord(admin, {
-    batchId,
-    name: batchName,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    prefix,
-    count: allDiscountIds.length,
-    discountIds: allDiscountIds,
-    template: { ...baseDiscount, functionId },
-    couponCodes,
-    nextIndex: couponCodes.length,
-    progress: { status: "complete", completed: couponCodes.length, total: couponCodes.length, errors },
-    lastCsvContent: csvContent,
-  });
-
-  completeJob(batchId, { csvContent });
-}
-
-async function createSingleCoupon({ admin, code, baseDiscount, functionId }) {
-  const discount = { ...baseDiscount, code, title: code };
-  const config = { discounts: [toFunctionDiscount(discount)] };
+async function createMasterDiscount({ admin, seedCode, baseDiscount, functionId, batchName }) {
+  const config = { discounts: [toFunctionDiscount({ ...baseDiscount, title: batchName })] };
 
   const mutation = `#graphql
-    mutation CreateBulkDiscountCode($codeAppDiscount: DiscountCodeAppInput!) {
+    mutation CreateMasterBulkDiscount($codeAppDiscount: DiscountCodeAppInput!) {
       discountCodeAppCreate(codeAppDiscount: $codeAppDiscount) {
         codeAppDiscount {
           discountId
-          codes(first: 1) {
-            nodes { code }
-          }
         }
         userErrors { field message }
       }
@@ -191,112 +179,139 @@ async function createSingleCoupon({ admin, code, baseDiscount, functionId }) {
 
   const response = await admin.graphql(mutation, {
     variables: {
-      codeAppDiscount: buildCodeAppDiscountInput({ discount, functionId, config }),
+      codeAppDiscount: buildCodeAppDiscountInput({
+        discount: { ...baseDiscount, code: seedCode, title: batchName },
+        functionId,
+        config,
+      }),
     },
   });
   const responseJson = await response.json();
 
-  // Defensive: a throttled/malformed response may not have .data at all
   if (!responseJson.data) {
     const message = responseJson.errors?.[0]?.message || "Request failed (no data returned)";
-    return { success: false, error: `${code}: ${message}` };
+    throw new Response(`Failed to create master discount: ${message}`, { status: 502 });
   }
 
   const payload = responseJson.data.discountCodeAppCreate;
-
   if (payload.userErrors.length) {
-    return {
-      success: false,
-      error: `${code}: ${payload.userErrors.map((e) => e.message).join("; ")}`,
-    };
+    throw new Response(
+      `Failed to create master discount: ${payload.userErrors.map((e) => e.message).join("; ")}`,
+      { status: 400 },
+    );
   }
 
-  // We trim the GraphQL selection set to reduce query cost, so we build
-  // the full coupon object from our own `discount` input rather than the
-  // (intentionally minimal) response — the only server-confirmed value we
-  // actually need back is the discountId and the final code.
-  const created = formatActionCoupon(
-    {
-      discountId: payload.codeAppDiscount.discountId,
-      codes: payload.codeAppDiscount.codes,
-    },
-    discount,
-  );
+  return payload.codeAppDiscount.discountId;
+}
 
-  return { success: true, created };
+async function runBulkGeneration({
+  shop,
+  batchId,
+  masterDiscountId,
+  couponCodes,
+  baseDiscount,
+  functionId,
+  batchName,
+  prefix,
+}) {
+  const { admin } = await unauthenticated.admin(shop);
+
+  // couponCodes[0] is already on Shopify as the seed code used to create
+  // the master discount. Only the remainder needs bulkAdd.
+  const remainingCodes = couponCodes.slice(1);
+
+  const { errors } = await addRedeemCodesToMaster(admin, masterDiscountId, remainingCodes);
+
+  updateJobProgress(batchId, { completed: couponCodes.length, newErrors: errors });
+
+  // Build the CSV from the full code list + shared config, then stash it
+  // on the in-memory job entry so the next progress poll can deliver it
+  // to the client for download. Must happen BEFORE completeJob so the
+  // poller sees csvContent and status=complete in the same response.
+  const csvContent = generateCSV(couponCodes, baseDiscount);
+  setJobCsv(batchId, csvContent);
+  completeJob(batchId);
+
+  // Persist the lightweight batch record — no couponCodes[], no
+  // lastCsvContent, no progress blob. addBatchRecord strips those fields
+  // even if accidentally passed, but we don't pass them here anyway.
+  await addBatchRecord(admin, {
+    batchId,
+    name: batchName,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    prefix,
+    count: couponCodes.length,
+    masterDiscountId,
+    template: { ...baseDiscount, functionId },
+  });
 }
 
 async function updateExistingBatch({ admin, formData, functionId, baseDiscount }) {
   const batchId = requiredString(formData, "batchId");
   const prefix = formData.get("prefix")?.toString().trim().toUpperCase() || "";
-  const batchName = prefix || undefined; // falls back to existingBatch.name below if empty
+  const batchName = prefix || undefined;
 
   const existingBatch = await getBatchRecord(admin, batchId);
   if (!existingBatch) {
     throw new Response("Batch not found.", { status: 404 });
   }
 
-  const errors = [];
-  const updatedDiscounts = [];
+  const config = {
+    discounts: [toFunctionDiscount({ ...baseDiscount, title: batchName || existingBatch.name })],
+  };
 
-  for (const discountId of existingBatch.discountIds) {
-    // Codes/titles are intentionally left untouched on update — only the
-    // shared template fields (value, eligibility, dates, etc.) change.
-    const discount = { ...baseDiscount };
-
-    const config = {
-      discounts: [toFunctionDiscount(discount)],
-    };
-
-    const mutation = `#graphql
-      mutation UpdateBulkDiscountCode($id: ID!, $codeAppDiscount: DiscountCodeAppInput!) {
-        discountCodeAppUpdate(id: $id, codeAppDiscount: $codeAppDiscount) {
-          codeAppDiscount {
-            discountId
-            title
-          }
-          userErrors {
-            field
-            message
-          }
+  const mutation = `#graphql
+    mutation UpdateMasterBulkDiscount($id: ID!, $codeAppDiscount: DiscountCodeAppInput!) {
+      discountCodeAppUpdate(id: $id, codeAppDiscount: $codeAppDiscount) {
+        codeAppDiscount {
+          discountId
         }
-      }`;
+        userErrors {
+          field
+          message
+        }
+      }
+    }`;
 
-    const response = await admin.graphql(mutation, {
-      variables: {
-        id: discountId,
-        codeAppDiscount: buildCodeAppDiscountInput({
-          discount,
-          functionId,
-          config,
-          isUpdate: true,
-        }),
-      },
-    });
+  const response = await admin.graphql(mutation, {
+    variables: {
+      id: existingBatch.masterDiscountId,
+      codeAppDiscount: buildCodeAppDiscountInput({
+        discount: { ...baseDiscount, title: batchName || existingBatch.name },
+        functionId,
+        config,
+        isUpdate: true,
+        previousCustomerEligibility: existingBatch.template?.customerEligibility,
+      }),
+    },
+  });
 
-    const responseJson = await response.json();
-    const payload = responseJson.data.discountCodeAppUpdate;
+  const responseJson = await response.json();
 
-    if (payload.userErrors.length) {
-      errors.push(
-        ...payload.userErrors.map((error) => `${discountId}: ${error.message}`),
-      );
-    } else {
-      updatedDiscounts.push(payload.codeAppDiscount.discountId);
-    }
+  if (!responseJson.data) {
+    const message = responseJson.errors?.[0]?.message || "Request failed (no data returned)";
+    return { intent: "update", batchId, updatedCount: 0, totalRequested: existingBatch.count, errors: [message] };
   }
 
-  await updateBatchRecord(admin, batchId, {
-    name: batchName || existingBatch.name,
-    updatedAt: new Date().toISOString(),
-    template: { ...baseDiscount, functionId },
-  });
+  const payload = responseJson.data.discountCodeAppUpdate;
+  const errors = payload.userErrors.length
+    ? payload.userErrors.map((error) => error.message)
+    : [];
+
+  if (!errors.length) {
+    await updateBatchRecord(admin, batchId, {
+      name: batchName || existingBatch.name,
+      updatedAt: new Date().toISOString(),
+      template: { ...baseDiscount, functionId },
+    });
+  }
 
   return {
     intent: "update",
     batchId,
-    updatedCount: updatedDiscounts.length,
-    totalRequested: existingBatch.discountIds.length,
+    updatedCount: errors.length ? 0 : existingBatch.count,
+    totalRequested: existingBatch.count,
     errors,
   };
 }
@@ -305,32 +320,7 @@ function generateBatchId() {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
     return crypto.randomUUID();
   }
-  // Fallback for environments without crypto.randomUUID
   return `batch_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function buildCsvRow(created) {
-  return {
-    code: created.code,
-    discountType: created.discountType,
-    discountValue: created.discountValue,
-    maxDiscountAmount: created.maxDiscountAmount ?? '',
-    usageLimit: created.usageLimit || "Unlimited",
-    appliesTo: formatAppliesToForCSV(created.appliesTo),
-    minimumRequirement: formatMinimumRequirementForCSV(created.minimumRequirement),
-    customerEligibility: formatCustomerEligibilityForCSV(created.customerEligibility),
-    appliesOncePerCustomer: created.appliesOncePerCustomer ? "Yes" : "No",
-    purchaseType: formatPurchaseTypeForCSV(created),
-    recurringPaymentLimit: formatRecurringCycleLimitForCSV(created),
-    tags: (created.tags || []).join("; "),
-    combinesWithProduct: created.combinesWith.productDiscounts ? "Yes" : "No",
-    combinesWithOrder: created.combinesWith.orderDiscounts ? "Yes" : "No",
-    combinesWithShipping: created.combinesWith.shippingDiscounts ? "Yes" : "No",
-    startsAt: created.startsAt ? new Date(created.startsAt).toLocaleString() : "Immediate",
-    endsAt: created.endsAt ? new Date(created.endsAt).toLocaleString() : "Never",
-    status: created.status,
-    discountId: created.id,
-  };
 }
 
 function generateUniqueCouponCodes(prefix, count) {
@@ -354,8 +344,8 @@ function generateRandomString(length) {
   return result;
 }
 
-function generateCSV(rows) {
-  if (rows.length === 0) return '';
+function generateCSV(couponCodes, baseDiscount) {
+  if (!couponCodes.length) return '';
 
   const headers = [
     'Coupon Code',
@@ -375,88 +365,37 @@ function generateCSV(rows) {
     'Combines With Shipping Discounts',
     'Start Date',
     'End Date',
-    'Status',
-    'Discount ID'
   ];
 
-  const csvRows = [headers.join(',')];
+  const sharedRow = [
+    baseDiscount.discountType || '',
+    baseDiscount.discountType === 'free_shipping' ? '' : baseDiscount.discountValue ?? '',
+    baseDiscount.discountType === 'free_shipping' ? '' : baseDiscount.maxDiscountAmount ?? '',
+    baseDiscount.usageLimit ?? 'Unlimited',
+    formatAppliesToForCSV(baseDiscount.appliesTo),
+    formatMinimumRequirementForCSV(baseDiscount.minimumRequirement),
+    formatCustomerEligibilityForCSV(baseDiscount.customerEligibility),
+    baseDiscount.appliesOncePerCustomer ? 'Yes' : 'No',
+    formatPurchaseTypeForCSV(baseDiscount),
+    formatRecurringCycleLimitForCSV(baseDiscount),
+    (baseDiscount.tags || []).join('; '),
+    baseDiscount.combinesWith?.productDiscounts ? 'Yes' : 'No',
+    baseDiscount.combinesWith?.orderDiscounts ? 'Yes' : 'No',
+    baseDiscount.combinesWith?.shippingDiscounts ? 'Yes' : 'No',
+    baseDiscount.startsAt ? new Date(baseDiscount.startsAt).toLocaleString() : 'Immediate',
+    baseDiscount.endsAt ? new Date(baseDiscount.endsAt).toLocaleString() : 'Never',
+  ];
 
-  for (const row of rows) {
-    const values = headers.map(header => {
-      // Map header to the actual key in the row object
-      let value;
-      switch(header) {
-        case 'Coupon Code':
-          value = row.code || '';
-          break;
-        case 'Discount Type':
-          value = row.discountType || '';
-          break;
-        case 'Discount Value':
-          value = row.discountValue || '';
-          break;
-        case 'Max Discount Amount':
-          value = row.maxDiscountAmount || '';
-          break;
-        case 'Usage Limit':
-          value = row.usageLimit || '';
-          break;
-        case 'Applies To':
-          value = row.appliesTo || '';
-          break;
-        case 'Minimum Requirement':
-          value = row.minimumRequirement || '';
-          break;
-        case 'Customer Eligibility':
-          value = row.customerEligibility || '';
-          break;
-        case 'Applies Once Per Customer':
-          value = row.appliesOncePerCustomer || '';
-          break;
-        case 'Purchase Type':
-          value = row.purchaseType || '';
-          break;
-        case 'Recurring Payment Limit':
-          value = row.recurringPaymentLimit || '';
-          break;
-        case 'Tags':
-          value = row.tags || '';
-          break;
-        case 'Combines With Product Discounts':
-          value = row.combinesWithProduct || '';
-          break;
-        case 'Combines With Order Discounts':
-          value = row.combinesWithOrder || '';
-          break;
-        case 'Combines With Shipping Discounts':
-          value = row.combinesWithShipping || '';
-          break;
-        case 'Start Date':
-          value = row.startsAt || '';
-          break;
-        case 'End Date':
-          value = row.endsAt || '';
-          break;
-        case 'Status':
-          value = row.status || '';
-          break;
-        case 'Discount ID':
-          value = row.discountId || '';
-          break;
-        default:
-          value = '';
-      }
+  const escape = (value) => {
+    if (typeof value === 'string' && (value.includes(',') || value.includes('"') || value.includes('\n'))) {
+      return `"${value.replace(/"/g, '""')}"`;
+    }
+    return value;
+  };
 
-      // Escape commas and quotes
-      if (typeof value === 'string' && (value.includes(',') || value.includes('"') || value.includes('\n'))) {
-        value = `"${value.replace(/"/g, '""')}"`;
-      }
-      return value;
-    });
-    csvRows.push(values.join(','));
-  }
+  const rows = couponCodes.map((code) => [code, ...sharedRow].map(escape).join(','));
 
-  return csvRows.join('\n');
+  return [headers.join(','), ...rows].join('\n');
 }
 
 function formatAppliesToForCSV(appliesTo) {
@@ -499,33 +438,34 @@ function formatRecurringCycleLimitForCSV(coupon) {
   return `First ${limit} payments`;
 }
 
-function buildCodeAppDiscountInput({ discount, functionId, config, isUpdate = false }) {
+// Add this helper near the other small helpers (e.g. near generateBatchId):
+function getDiscountClasses(discountType) {
+  // free_shipping is a SHIPPING-class discount; percentage/fixed are
+  // ORDER-class. Mutually exclusive in this app's model.
+  return discountType === "free_shipping" ? ["SHIPPING"] : ["ORDER"];
+}
+
+function buildCodeAppDiscountInput({ discount, functionId, config, isUpdate = false, previousCustomerEligibility = null, }) {
   return {
-    // Codes can't be changed via discountCodeAppUpdate, and on update we
-    // deliberately don't touch code/title anyway (see updateExistingBatch).
     ...(isUpdate ? {} : { code: discount.code, title: discount.title }),
     functionId,
-
-    discountClasses: ["ORDER"],
+    discountClasses: getDiscountClasses(discount.discountType),
     appliesOncePerCustomer: discount.appliesOncePerCustomer,
     combinesWith: {
       orderDiscounts: discount.combinesWith.orderDiscounts,
       productDiscounts: discount.combinesWith.productDiscounts,
       shippingDiscounts: discount.combinesWith.shippingDiscounts,
     },
-    customerSelection: buildCustomerSelectionInput(discount.customerEligibility),
+    customerSelection: buildCustomerSelectionInput(discount.customerEligibility, previousCustomerEligibility),
     startsAt: discount.startsAt || new Date().toISOString(),
     endsAt: discount.endsAt,
     usageLimit: discount.usageLimit,
     appliesOnOneTimePurchase: discount.appliesOnOneTimePurchase,
     appliesOnSubscription: discount.appliesOnSubscription,
-    // Only send recurringCycleLimit when the discount actually applies to
-    // subscriptions; the field defaults to 1 on Shopify's side otherwise.
     ...(discount.appliesOnSubscription && discount.recurringCycleLimit !== null
       ? { recurringCycleLimit: discount.recurringCycleLimit }
       : {}),
     tags: discount.tags,
-
     metafields: [
       {
         namespace: CONFIG_NAMESPACE,
@@ -533,10 +473,6 @@ function buildCodeAppDiscountInput({ discount, functionId, config, isUpdate = fa
         type: "json",
         value: JSON.stringify(config),
       },
-      // Must exactly match shopify.extension.toml's
-      // [extensions.input.variables] namespace/key. See the same fix
-      // applied in app._index.jsx for the single-discount flow — this
-      // file needs the identical write, once per coupon in the batch.
       {
         namespace: "$app",
         key: "collection-ids",
@@ -552,45 +488,53 @@ function buildCodeAppDiscountInput({ discount, functionId, config, isUpdate = fa
   };
 }
 
-function buildCustomerSelectionInput(customerEligibility) {
-  if (customerEligibility.mode === "segments") {
+function buildCustomerSelectionInput(newEligibility, previousEligibility) {
+  const prevSegmentIds = previousEligibility?.mode === "segments" ? previousEligibility.segmentIds : [];
+  const prevCustomerIds = previousEligibility?.mode === "customers" ? previousEligibility.customerIds : [];
+
+  if (newEligibility.mode === "segments") {
+    const toAdd = newEligibility.segmentIds.filter((id) => !prevSegmentIds.includes(id));
+    const toRemove = prevSegmentIds.filter((id) => !newEligibility.segmentIds.includes(id));
+    // Also need to clear out any previous customer-based selection if mode switched
+    const removeCustomers = prevCustomerIds.length ? { customers: { remove: prevCustomerIds } } : {};
     return {
-      customerSegments: { add: customerEligibility.segmentIds },
+      customerSegments: { add: toAdd, remove: toRemove },
+      ...removeCustomers,
     };
   }
 
-  if (customerEligibility.mode === "customers") {
+  if (newEligibility.mode === "customers") {
+    const toAdd = newEligibility.customerIds.filter((id) => !prevCustomerIds.includes(id));
+    const toRemove = prevCustomerIds.filter((id) => !newEligibility.customerIds.includes(id));
+    const removeSegments = prevSegmentIds.length ? { customerSegments: { remove: prevSegmentIds } } : {};
     return {
-      customers: { add: customerEligibility.customerIds },
+      customers: { add: toAdd, remove: toRemove },
+      ...removeSegments,
     };
   }
 
-  return { all: true };
+  // mode === "all" — need to remove everything previously set
+  const removeSegments = prevSegmentIds.length ? { customerSegments: { remove: prevSegmentIds } } : {};
+  const removeCustomers = prevCustomerIds.length ? { customers: { remove: prevCustomerIds } } : {};
+  return { all: true, ...removeSegments, ...removeCustomers };
 }
 
 export default function BulkDiscount() {
-  const { selectedFunctionId, segments, editingBatch } = useLoaderData();
+  const { selectedFunctionId, segments, editingBatch, editingCustomerLabels } = useLoaderData();
   const fetcher = useFetcher();
   const shopify = useAppBridge();
   const [searchParams] = useSearchParams();
   const batchId = searchParams.get("batchId");
   const isEditing = Boolean(editingBatch);
 
-  const [formData, setFormData] = useState(() =>
-    createInitialFormData(editingBatch),
-  );
+  const [formData, setFormData] = useState(() => createInitialFormData(editingBatch, editingCustomerLabels));
   const isSubmitting = fetcher.state === "submitting";
   const hasFunction = Boolean(selectedFunctionId);
   const errors = fetcher.data?.errors || [];
-  const generatedCount = fetcher.data?.count || 0;
   const updatedCount = fetcher.data?.updatedCount || 0;
   const totalRequested = fetcher.data?.totalRequested || 0;
-  const csvContent = fetcher.data?.csvContent || '';
   const isUpdateResult = fetcher.data?.intent === "update";
 
-  // Defensive defaults: guards against stale/partial state shapes (e.g. from
-  // hot-reload preserving an older formData shape) so a missing key never
-  // crashes the render.
   const purchaseType = formData.purchaseType || "both";
   const recurringPaymentLimit = formData.recurringPaymentLimit || { mode: "all", value: "" };
   const tags = formData.tags ?? "";
@@ -599,9 +543,11 @@ export default function BulkDiscount() {
     rowId: null,
     query: "",
     results: [],
-    loading: false
+    loading: false,
   });
   const [progress, setProgress] = useState(null);
+
+  const [showUpdateBanner, setShowUpdateBanner] = useState(false);
 
   useEffect(() => {
     if (fetcher.data?.started && fetcher.data?.batchId) {
@@ -622,7 +568,7 @@ export default function BulkDiscount() {
             const safeName = (formData.prefix || "batch").replace(/[^a-z0-9-]+/gi, "-");
             downloadCSV(
               data.csvContent,
-              `bulk-discounts-${safeName}-${new Date().toISOString().slice(0, 10)}.csv`
+              `bulk-discounts-${safeName}-${new Date().toISOString().slice(0, 10)}.csv`,
             );
           }
         }
@@ -634,20 +580,23 @@ export default function BulkDiscount() {
 
   useEffect(() => {
     if (isUpdateResult && updatedCount > 0) {
-      shopify.toast.show(`${updatedCount} coupon${updatedCount > 1 ? 's' : ''} updated successfully`);
+      shopify.toast.show(`Batch updated successfully`);
+      setShowUpdateBanner(true);
+      const timer = setTimeout(() => setShowUpdateBanner(false), 4000);
+      return () => clearTimeout(timer);
     }
   }, [isUpdateResult, updatedCount, shopify]);
 
   useEffect(() => {
     if (errors.length > 0) {
-      shopify.toast.show(`${errors.length} error${errors.length > 1 ? 's' : ''} occurred during generation`, {
-        tone: 'critical'
+      shopify.toast.show(`${errors.length} error${errors.length > 1 ? "s" : ""} occurred`, {
+        tone: "critical",
       });
     }
   }, [errors, shopify]);
 
   const updateFormData = (field, value) => {
-    setFormData(prev => ({ ...prev, [field]: value }));
+    setFormData((prev) => ({ ...prev, [field]: value }));
   };
 
   const pickResources = async (resourceType) => {
@@ -665,30 +614,30 @@ export default function BulkDiscount() {
       title: item.title || item.handle,
     }));
 
-    updateFormData('appliesTo', {
+    updateFormData("appliesTo", {
       mode: resourceType === "product" ? "products" : "collections",
       resources: picked,
     });
   };
 
   const searchCustomers = async (query) => {
-    setCustomerSearch({ rowId: 'main', query, results: [], loading: true });
+    setCustomerSearch({ rowId: "main", query, results: [], loading: true });
 
     if (!query.trim()) {
-      setCustomerSearch({ rowId: 'main', query, results: [], loading: false });
+      setCustomerSearch({ rowId: "main", query, results: [], loading: false });
       return;
     }
 
     const response = await fetch(`/app/customer-search?q=${encodeURIComponent(query)}`);
     const data = await response.json();
-    setCustomerSearch({ rowId: 'main', query, results: data.customers || [], loading: false });
+    setCustomerSearch({ rowId: "main", query, results: data.customers || [], loading: false });
   };
 
   const addCustomer = (customer) => {
     const currentIds = formData.customerEligibility.customerIds || [];
     if (currentIds.includes(customer.id)) return;
 
-    updateFormData('customerEligibility', {
+    updateFormData("customerEligibility", {
       ...formData.customerEligibility,
       mode: "customers",
       customerIds: [...currentIds, customer.id],
@@ -700,7 +649,7 @@ export default function BulkDiscount() {
     const currentIds = formData.customerEligibility.customerIds || [];
     if (!currentIds.includes(customerId)) return;
 
-    updateFormData('customerEligibility', {
+    updateFormData("customerEligibility", {
       ...formData.customerEligibility,
       customerIds: currentIds.filter((id) => id !== customerId),
       customerLabels: (formData.customerEligibility.customerLabels || []).filter(
@@ -710,11 +659,11 @@ export default function BulkDiscount() {
   };
 
   const downloadCSV = (csv, filename) => {
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
     const url = URL.createObjectURL(blob);
-    link.setAttribute('href', url);
-    link.setAttribute('download', filename);
+    link.setAttribute("href", url);
+    link.setAttribute("download", filename);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -725,12 +674,15 @@ export default function BulkDiscount() {
     setFormData(createInitialFormData(isEditing ? editingBatch : null));
   };
 
+  // Add this state near your other useState declarations
+  const [isEndDateCalendarOpen, setIsEndDateCalendarOpen] = useState(false);
+
   return (
     <s-page inlineSize="base">
       <s-section>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
           <s-text variant="headingLg">
-            {isEditing ? `Edit Batch: ${editingBatch.name}` : 'Bulk Discount Generation'}
+            {isEditing ? `Edit Batch: ${editingBatch.name}` : "Bulk Discount Generation"}
           </s-text>
           <Link to="/app">
             <s-button variant="primary" icon="arrow-left">Go to dashboard</s-button>
@@ -741,8 +693,7 @@ export default function BulkDiscount() {
           <s-banner tone="info" heading="Editing an existing batch">
             <s-text>
               Updating shared settings will apply to all {editingBatch.count}{" "}
-              existing coupon codes in this batch. Codes themselves won't
-              change.
+              existing coupon codes in this batch. Codes themselves won't change.
             </s-text>
           </s-banner>
         )}
@@ -751,53 +702,24 @@ export default function BulkDiscount() {
           <s-stack direction="block" gap="base">
             {!hasFunction && (
               <s-banner tone="critical" heading="Discount Function not found">
-                Deploy the max-discount Function extension, then reload this
-                page to create coupons.
+                Deploy the max-discount Function extension, then reload this page to create coupons.
               </s-banner>
             )}
 
-            {/* {errors.length > 0 && (
-              <s-banner tone="critical" heading={isUpdateResult ? "Some coupons were not updated" : "Some coupons were not created"}>
-                <s-unordered-list>
-                  {errors.map((error) => (
-                    <s-list-item key={error}>{error}</s-list-item>
-                  ))}
-                </s-unordered-list>
-              </s-banner>
-            )}
-
-            {!isUpdateResult && generatedCount > 0 && (
-              <s-banner tone="success" heading={`${generatedCount} of ${totalRequested} coupons generated successfully`}>
-                <s-text>
-                  CSV file has been downloaded automatically. View it anytime
-                  from{" "}
-                  <Link to="/app/bulk-discount-sets">Bulk Discount Sets</Link>.
-                </s-text>
-              </s-banner>
-            )} */}
-
-            {/* ✅ ADD the new progress banners HERE, in that same spot */}
             {progress?.status === "processing" && (
               <s-banner tone="info" heading="Generating coupons…">
                 <s-text>
-                  {progress.completed} of {progress.total} created
-                  {progress.errors?.length > 0 ? ` (${progress.errors.length} errors so far)` : ""}
+                  Creating the discount and attaching {progress.total} coupon codes. This can take
+                  a little while for large batches — feel free to navigate away, it'll keep running.
                 </s-text>
               </s-banner>
             )}
 
-            {progress?.status === "complete" && (
-              <s-banner tone="success" heading={`${progress.completed} of ${progress.total} coupons generated successfully`}>
+            {showUpdateBanner && (
+              <s-banner tone="success" heading="Batch updated successfully">
                 <s-text>
-                  CSV file has been downloaded automatically. View it anytime from{" "}
-                  <Link to="/app/bulk-discount-sets">Bulk Discount Sets</Link>.
+                  Shared settings have been applied to all {totalRequested} coupons in this batch.
                 </s-text>
-              </s-banner>
-            )}
-
-            {isUpdateResult && updatedCount > 0 && (
-              <s-banner tone="success" heading={`${updatedCount} of ${totalRequested} coupons updated successfully`}>
-                <s-text>Shared settings have been applied to this batch.</s-text>
               </s-banner>
             )}
 
@@ -805,7 +727,6 @@ export default function BulkDiscount() {
             <input type="hidden" name="intent" value={isEditing ? "update" : "create"} />
             {isEditing && <input type="hidden" name="batchId" value={batchId} />}
 
-            {/* Bulk Generation Specific Fields */}
             <s-card>
               <s-stack direction="block" gap="base">
                 <s-text variant="headingSm">
@@ -822,7 +743,7 @@ export default function BulkDiscount() {
                         max={MAX_COUPONS}
                         step={1}
                         value={formData.numberOfCoupons}
-                        onChange={(e) => updateFormData('numberOfCoupons', e.target.value)}
+                        onChange={(e) => updateFormData("numberOfCoupons", e.target.value)}
                         required
                         helpText={`Maximum ${MAX_COUPONS} coupons`}
                       />
@@ -833,29 +754,26 @@ export default function BulkDiscount() {
                         name="prefix"
                         placeholder="SUMMER"
                         value={formData.prefix}
-                        onChange={(e) => updateFormData('prefix', e.target.value)}
+                        onChange={(e) => updateFormData("prefix", e.target.value)}
                         helpText="Optional: Prefix for all coupon codes"
                       />
                     </s-box>
                   </s-stack>
                 )}
-
               </s-stack>
             </s-card>
 
-            {/* Main Discount Configuration */}
             <s-card>
               <s-stack direction="block" gap="base">
                 <s-text variant="headingSm">Discount Configuration</s-text>
 
-                {/* --- Value --- */}
                 <s-stack direction="inline" justifyContent="space-between" alignItems="center">
                   <s-box inlineSize="49%">
                     <s-select
                       label="Discount type"
                       name="discountType"
                       value={formData.discountType}
-                      onChange={(e) => updateFormData('discountType', e.target.value)}
+                      onChange={(e) => updateFormData("discountType", e.target.value)}
                       required
                     >
                       <s-option value="percentage">Percentage off</s-option>
@@ -872,14 +790,14 @@ export default function BulkDiscount() {
                         step={0.01}
                         placeholder="10"
                         value={formData.discountValue}
-                        onChange={(e) => updateFormData('discountValue', e.target.value)}
+                        onChange={(e) => updateFormData("discountValue", e.target.value)}
                         required
                       />
                     </s-box>
                   )}
                 </s-stack>
 
-                {formData.discountType !== "free_shipping" && (
+                {formData.discountType === "percentage" && (
                   <s-money-field
                     label="Maximum discount amount"
                     name="maxDiscountAmount"
@@ -887,12 +805,11 @@ export default function BulkDiscount() {
                     max={999999}
                     placeholder="100"
                     value={formData.maxDiscountAmount}
-                    onChange={(e) => updateFormData('maxDiscountAmount', e.target.value)}
+                    onChange={(e) => updateFormData("maxDiscountAmount", e.target.value)}
                     required
                   />
                 )}
 
-                {/* --- Applies to + Purchase type --- */}
                 <s-stack direction="inline" justifyContent="space-between" alignItems="center">
                   <s-box inlineSize="50%">
                     <s-select
@@ -900,10 +817,7 @@ export default function BulkDiscount() {
                       name="appliesToMode"
                       value={formData.appliesTo.mode}
                       onChange={(e) =>
-                        updateFormData('appliesTo', {
-                          mode: e.target.value,
-                          resources: [],
-                        })
+                        updateFormData("appliesTo", { mode: e.target.value, resources: [] })
                       }
                     >
                       <s-option value="all">All products</s-option>
@@ -916,7 +830,7 @@ export default function BulkDiscount() {
                       label="Purchase type"
                       name="purchaseType"
                       value={purchaseType}
-                      onChange={(e) => updateFormData('purchaseType', e.target.value)}
+                      onChange={(e) => updateFormData("purchaseType", e.target.value)}
                     >
                       <s-option value="one_time">One-time purchase</s-option>
                       <s-option value="subscription">Subscription</s-option>
@@ -931,9 +845,7 @@ export default function BulkDiscount() {
                       type="button"
                       variant="secondary"
                       onClick={() =>
-                        pickResources(
-                          formData.appliesTo.mode === "products" ? "product" : "collection",
-                        )
+                        pickResources(formData.appliesTo.mode === "products" ? "product" : "collection")
                       }
                     >
                       {formData.appliesTo.resources.length > 0
@@ -958,7 +870,6 @@ export default function BulkDiscount() {
                   </s-stack>
                 )}
 
-                {/* --- Minimum requirement + Customer eligibility --- */}
                 <s-stack direction="inline" gap="base" alignItems="start">
                   <s-box inlineSize="50%">
                     <s-stack direction="block" gap="tight">
@@ -967,10 +878,7 @@ export default function BulkDiscount() {
                         name="minimumRequirementMode"
                         value={formData.minimumRequirement.mode}
                         onChange={(e) =>
-                          updateFormData('minimumRequirement', {
-                            mode: e.target.value,
-                            value: "",
-                          })
+                          updateFormData("minimumRequirement", { mode: e.target.value, value: "" })
                         }
                       >
                         <s-option value="none">None</s-option>
@@ -986,7 +894,7 @@ export default function BulkDiscount() {
                           step={1}
                           value={formData.minimumRequirement.value}
                           onChange={(e) =>
-                            updateFormData('minimumRequirement', {
+                            updateFormData("minimumRequirement", {
                               ...formData.minimumRequirement,
                               value: e.target.value,
                             })
@@ -1000,7 +908,7 @@ export default function BulkDiscount() {
                           min={0.01}
                           value={formData.minimumRequirement.value}
                           onChange={(e) =>
-                            updateFormData('minimumRequirement', {
+                            updateFormData("minimumRequirement", {
                               ...formData.minimumRequirement,
                               value: e.target.value,
                             })
@@ -1017,7 +925,7 @@ export default function BulkDiscount() {
                         name="customerEligibilityMode"
                         value={formData.customerEligibility.mode}
                         onChange={(e) =>
-                          updateFormData('customerEligibility', {
+                          updateFormData("customerEligibility", {
                             mode: e.target.value,
                             segmentIds: [],
                             customerIds: [],
@@ -1046,7 +954,7 @@ export default function BulkDiscount() {
                                     const segmentIds = e.target.checked
                                       ? [...formData.customerEligibility.segmentIds, segment.id]
                                       : formData.customerEligibility.segmentIds.filter((id) => id !== segment.id);
-                                    updateFormData('customerEligibility', {
+                                    updateFormData("customerEligibility", {
                                       ...formData.customerEligibility,
                                       segmentIds,
                                     });
@@ -1099,17 +1007,12 @@ export default function BulkDiscount() {
                           <s-text-field
                             label="Search customers"
                             placeholder="Search by name or email"
-                            value={customerSearch.rowId === 'main' ? customerSearch.query : ""}
+                            value={customerSearch.rowId === "main" ? customerSearch.query : ""}
                             onChange={(e) => searchCustomers(e.target.value)}
                           />
 
-                          {customerSearch.rowId === 'main' && customerSearch.query.trim() && (
-                            <s-box
-                              borderWidth="base"
-                              borderColor="base"
-                              borderRadius="base"
-                              padding="tight"
-                            >
+                          {customerSearch.rowId === "main" && customerSearch.query.trim() && (
+                            <s-box borderWidth="base" borderColor="base" borderRadius="base" padding="tight">
                               {customerSearch.loading ? (
                                 <s-box padding="base">
                                   <s-text tone="subdued">Searching…</s-text>
@@ -1123,23 +1026,11 @@ export default function BulkDiscount() {
                                   {customerSearch.results.map((c) => {
                                     const alreadyAdded = formData.customerEligibility.customerIds.includes(c.id);
                                     return (
-                                      <s-box
-                                        key={c.id}
-                                        padding="tight"
-                                        borderBlockEnd="base"
-                                      >
-                                        <s-stack
-                                          direction="inline"
-                                          justifyContent="space-between"
-                                          alignItems="center"
-                                        >
+                                      <s-box key={c.id} padding="tight" borderBlockEnd="base">
+                                        <s-stack direction="inline" justifyContent="space-between" alignItems="center">
                                           <s-stack direction="block" gap="none">
-                                            <s-text variant="bodySm" fontWeight="medium">
-                                              {c.displayName}
-                                            </s-text>
-                                            <s-text variant="bodySm" tone="subdued">
-                                              {c.email}
-                                            </s-text>
+                                            <s-text variant="bodySm" fontWeight="medium">{c.displayName}</s-text>
+                                            <s-text variant="bodySm" tone="subdued">{c.email}</s-text>
                                           </s-stack>
                                           <s-button
                                             type="button"
@@ -1176,10 +1067,7 @@ export default function BulkDiscount() {
                       name="recurringPaymentLimitMode"
                       value={recurringPaymentLimit.mode}
                       onChange={(e) =>
-                        updateFormData('recurringPaymentLimit', {
-                          mode: e.target.value,
-                          value: "",
-                        })
+                        updateFormData("recurringPaymentLimit", { mode: e.target.value, value: "" })
                       }
                       helpText="Includes payment on first order."
                     >
@@ -1197,7 +1085,7 @@ export default function BulkDiscount() {
                         placeholder="1"
                         value={recurringPaymentLimit.value}
                         onChange={(e) =>
-                          updateFormData('recurringPaymentLimit', {
+                          updateFormData("recurringPaymentLimit", {
                             ...recurringPaymentLimit,
                             value: e.target.value,
                           })
@@ -1207,18 +1095,17 @@ export default function BulkDiscount() {
                   </s-stack>
                 )}
 
-                {/* --- Total usage limit + Tags --- */}
                 <s-stack direction="inline" justifyContent="space-between" alignItems="center">
                   <s-box inlineSize="50%">
                     <s-number-field
-                      label="Total usage limit per coupon"
+                      label="Usage limit per coupon code"
                       name="usageLimit"
                       min={1}
                       step={1}
                       inputMode="numeric"
                       value={formData.usageLimit}
-                      onChange={(e) => updateFormData('usageLimit', e.target.value)}
-                      helpText="Leave empty for unlimited usage"
+                      onChange={(e) => updateFormData("usageLimit", e.target.value)}
+                      helpText="Applies independently to each coupon code. Leave empty for unlimited usage."
                     />
                   </s-box>
                   <s-box inlineSize="49%">
@@ -1227,7 +1114,7 @@ export default function BulkDiscount() {
                       name="tags"
                       placeholder="loyalty, vip, summer-sale"
                       value={tags}
-                      onChange={(e) => updateFormData('tags', e.target.value)}
+                      onChange={(e) => updateFormData("tags", e.target.value)}
                       helpText="Optional: Comma-separated keywords"
                     />
                   </s-box>
@@ -1237,19 +1124,16 @@ export default function BulkDiscount() {
                   label="Limit to one use per customer"
                   name="appliesOncePerCustomer"
                   checked={formData.appliesOncePerCustomer}
-                  onChange={(e) =>
-                    updateFormData('appliesOncePerCustomer', e.target.checked)
-                  }
+                  onChange={(e) => updateFormData("appliesOncePerCustomer", e.target.checked)}
                 />
 
-                {/* --- Combinations --- */}
                 <s-text variant="bodyMd" fontWeight="medium">Combinations</s-text>
                 <s-checkbox
                   label="Combines with product discounts"
                   name="combinesWithProduct"
                   checked={formData.combinesWith.productDiscounts}
                   onChange={(e) =>
-                    updateFormData('combinesWith', {
+                    updateFormData("combinesWith", {
                       ...formData.combinesWith,
                       productDiscounts: e.target.checked,
                     })
@@ -1260,32 +1144,33 @@ export default function BulkDiscount() {
                   name="combinesWithOrder"
                   checked={formData.combinesWith.orderDiscounts}
                   onChange={(e) =>
-                    updateFormData('combinesWith', {
+                    updateFormData("combinesWith", {
                       ...formData.combinesWith,
                       orderDiscounts: e.target.checked,
                     })
                   }
                 />
-                <s-checkbox
-                  label="Combines with shipping discounts"
-                  name="combinesWithShipping"
-                  checked={formData.combinesWith.shippingDiscounts}
-                  onChange={(e) =>
-                    updateFormData('combinesWith', {
-                      ...formData.combinesWith,
-                      shippingDiscounts: e.target.checked,
-                    })
-                  }
-                />
+                {formData.discountType !== "free_shipping" && (
+                  <s-checkbox
+                    label="Combines with shipping discounts"
+                    name="combinesWithShipping"
+                    checked={formData.combinesWith.shippingDiscounts}
+                    onChange={(e) =>
+                      updateFormData("combinesWith", {
+                        ...formData.combinesWith,
+                        shippingDiscounts: e.target.checked,
+                      })
+                    }
+                  />
+                )}
 
-                {/* --- Active dates --- */}
                 <s-stack direction="inline" gap="base">
                   <s-box inlineSize="50%">
                     <s-date-field
                       label="Start date"
                       name="startsAtDate"
                       value={formData.startsAtDate}
-                      onChange={(e) => updateFormData('startsAtDate', e.target.value)}
+                      onChange={(e) => updateFormData("startsAtDate", e.target.value)}
                     />
                   </s-box>
                   <s-box inlineSize="50%">
@@ -1294,19 +1179,28 @@ export default function BulkDiscount() {
                       type="time"
                       name="startsAtTime"
                       value={formData.startsAtTime}
-                      onChange={(e) => updateFormData('startsAtTime', e.target.value)}
+                      onChange={(e) => updateFormData("startsAtTime", e.target.value)}
                     />
                   </s-box>
                 </s-stack>
 
                 <s-stack direction="inline" gap="base">
                   <s-box inlineSize="50%">
+                  <div style={{ 
+                    position: 'relative',
+                    overflow: 'visible',
+                    zIndex: 9999,
+                    marginBottom: isEndDateCalendarOpen ? '100px' : '0px',// Reserve space for the calendar above
+                  }}>
                     <s-date-field
                       label="End date"
                       name="endsAt"
                       value={formData.endsAt}
-                      onChange={(e) => updateFormData('endsAt', e.target.value)}
+                      onChange={(e) => updateFormData("endsAt", e.target.value)}
+                      onFocus={() => setIsEndDateCalendarOpen(true)} // Calendar opens
+                      onBlur={() => setIsEndDateCalendarOpen(false)} // Calendar closes
                     />
+                  </div>
                   </s-box>
                   <s-box inlineSize="50%">
                     <s-text-field
@@ -1314,7 +1208,7 @@ export default function BulkDiscount() {
                       type="time"
                       name="endsAtTime"
                       value={formData.endsAtTime}
-                      onChange={(e) => updateFormData('endsAtTime', e.target.value)}
+                      onChange={(e) => updateFormData("endsAtTime", e.target.value)}
                       disabled={!formData.endsAt}
                     />
                   </s-box>
@@ -1322,7 +1216,6 @@ export default function BulkDiscount() {
               </s-stack>
             </s-card>
 
-            {/* Action Buttons */}
             <s-stack direction="inline" gap="base" alignItems="center">
               <s-button
                 variant="primary"
@@ -1331,25 +1224,23 @@ export default function BulkDiscount() {
                 {...(isSubmitting ? { loading: true } : {})}
               >
                 {isSubmitting
-                  ? (isEditing ? 'Updating...' : 'Generating...')
-                  : (isEditing ? 'Update Batch' : 'Generate Bulk Discounts')}
+                  ? isEditing
+                    ? "Updating..."
+                    : "Generating..."
+                  : isEditing
+                    ? "Update Batch"
+                    : "Generate Bulk Discounts"}
               </s-button>
 
               {!isEditing && (
-                <s-button
-                  type="button"
-                  variant="secondary"
-                  onClick={resetForm}
-                >
+                <s-button type="button" variant="secondary" onClick={resetForm}>
                   Reset Form
                 </s-button>
               )}
 
               {isEditing && (
-                <Link to="/app/bulk-discount-sets">
-                  <s-button type="button" variant="secondary">
-                    Cancel
-                  </s-button>
+                <Link to="/app">
+                  <s-button type="button" variant="secondary">Cancel</s-button>
                 </Link>
               )}
             </s-stack>
@@ -1362,9 +1253,7 @@ export default function BulkDiscount() {
 
 function findDefaultFunction(functions) {
   return (
-    functions.find((shopifyFunction) =>
-      shopifyFunction.title.toLowerCase().includes("max"),
-    ) || functions[0]
+    functions.find((f) => f.title.toLowerCase().includes("max")) || functions[0]
   );
 }
 
@@ -1375,60 +1264,44 @@ function parseBulkDiscountConfig(formData) {
   const discountValue = isFreeShipping ? 0 : Number(formData.get("discountValue"));
   const maxDiscountAmount = isFreeShipping ? null : Number(formData.get("maxDiscountAmount"));
   const usageLimit = normalizeUsageLimit(formData.get("usageLimit"));
-  const startsAt = normalizeStartDateTime(
-    formData.get("startsAtDate"),
-    formData.get("startsAtTime")
-  );
-  const endsAt = normalizeEndDateTime(
-    formData.get("endsAt"),
-    formData.get("endsAtTime")
-  );
+  const startsAt = normalizeStartDateTime(formData.get("startsAtDate"), formData.get("startsAtTime"));
+  const endsAt = normalizeEndDateTime(formData.get("endsAt"), formData.get("endsAtTime"));
 
   if (!["percentage", "fixed", "free_shipping"].includes(discountType)) {
-    throw new Response("Choose percentage, fixed, or free shipping.", {
-      status: 400,
-    });
+    throw new Response("Choose percentage, fixed, or free shipping.", { status: 400 });
   }
 
   if (!isFreeShipping) {
     if (!Number.isFinite(discountValue) || discountValue <= 0) {
-      throw new Response("Discount value must be greater than 0.", {
-        status: 400,
-      });
+      throw new Response("Discount value must be greater than 0.", { status: 400 });
     }
-
     if (discountType === "percentage" && discountValue > 100) {
-      throw new Response("Percentage cannot be more than 100%.", {
-        status: 400,
-      });
+      throw new Response("Percentage cannot be more than 100%.", { status: 400 });
     }
-
     if (!Number.isFinite(maxDiscountAmount) || maxDiscountAmount <= 0) {
-      throw new Response("Maximum discount amount must be greater than 0.", {
-        status: 400,
-      });
+      throw new Response("Maximum discount amount must be greater than 0.", { status: 400 });
     }
   }
 
   const appliesTo = normalizeAppliesTo(
     formData.get("appliesToMode"),
     formData.get("appliesToIds"),
-    formData.get("appliesToTitles")
+    formData.get("appliesToTitles"),
   );
   const minimumRequirement = normalizeMinimumRequirement(
     formData.get("minimumRequirementMode"),
-    formData.get("minimumRequirementValue")
+    formData.get("minimumRequirementValue"),
   );
   const customerEligibility = normalizeCustomerEligibility(
     formData.get("customerEligibilityMode"),
     formData.get("customerSegmentIds"),
-    formData.get("customerIds")
+    formData.get("customerIds"),
   );
   const purchaseType = normalizePurchaseType(formData.get("purchaseType"));
   const recurringCycleLimit = normalizeRecurringCycleLimit(
     purchaseType,
     formData.get("recurringPaymentLimitMode"),
-    formData.get("recurringPaymentLimitValue")
+    formData.get("recurringPaymentLimitValue"),
   );
   const tags = normalizeTags(formData.get("tags"));
 
@@ -1443,7 +1316,7 @@ function parseBulkDiscountConfig(formData) {
     combinesWith: {
       productDiscounts: formData.get("combinesWithProduct") === "on",
       orderDiscounts: formData.get("combinesWithOrder") === "on",
-      shippingDiscounts: formData.get("combinesWithShipping") === "on",
+      shippingDiscounts: discountType === "free_shipping" ? false : formData.get("combinesWithShipping") === "on",
     },
     appliesTo,
     minimumRequirement,
@@ -1457,11 +1330,9 @@ function parseBulkDiscountConfig(formData) {
 
 function normalizePurchaseType(purchaseTypeRaw) {
   const mode = purchaseTypeRaw?.toString().trim() || "both";
-
   if (!["one_time", "subscription", "both"].includes(mode)) {
     throw new Response("Invalid purchase type selection.", { status: 400 });
   }
-
   return {
     oneTime: mode === "one_time" || mode === "both",
     subscription: mode === "subscription" || mode === "both",
@@ -1469,73 +1340,41 @@ function normalizePurchaseType(purchaseTypeRaw) {
 }
 
 function normalizeRecurringCycleLimit(purchaseType, mode, value) {
-  // Only meaningful when the discount applies to subscriptions at all.
-  if (!purchaseType.subscription) {
-    return null;
-  }
+  if (!purchaseType.subscription) return null;
 
   const normalizedMode = mode?.toString().trim() || "all";
-
   if (!["all", "first", "limited"].includes(normalizedMode)) {
-    throw new Response("Invalid recurring payment limit selection.", {
-      status: 400,
-    });
+    throw new Response("Invalid recurring payment limit selection.", { status: 400 });
   }
-
-  // 0 = applies to every recurring payment indefinitely.
-  if (normalizedMode === "all") {
-    return 0;
-  }
-
-  // 1 = applies to the first payment only (includes the first order, per Shopify's semantics).
-  if (normalizedMode === "first") {
-    return 1;
-  }
+  if (normalizedMode === "all") return 0;
+  if (normalizedMode === "first") return 1;
 
   const numericValue = Number(value);
-
   if (!Number.isInteger(numericValue) || numericValue < 1) {
-    throw new Response(
-      "Multiple payments limit must be a whole number of 1 or more.",
-      { status: 400 },
-    );
+    throw new Response("Multiple payments limit must be a whole number of 1 or more.", { status: 400 });
   }
-
   return numericValue;
 }
 
 function normalizeTags(tagsRaw) {
   const raw = tagsRaw?.toString().trim() || "";
-  if (!raw) {
-    return [];
-  }
-
-  return raw
-    .split(",")
-    .map((tag) => tag.trim())
-    .filter(Boolean);
+  if (!raw) return [];
+  return raw.split(",").map((tag) => tag.trim()).filter(Boolean);
 }
 
 function normalizeAppliesTo(mode, idsCsv, titlesDelimited) {
   const normalizedMode = mode?.toString().trim() || "all";
- 
   if (!["all", "products", "collections"].includes(normalizedMode)) {
     throw new Response("Invalid 'applies to' selection.", { status: 400 });
   }
- 
-  if (normalizedMode === "all") {
-    return { mode: "all", resources: [] };
-  }
- 
+  if (normalizedMode === "all") return { mode: "all", resources: [] };
+
   const ids = (idsCsv?.toString() || "").split(",").filter(Boolean);
   const titles = (titlesDelimited?.toString() || "").split("||").filter((_, i) => i < ids.length);
- 
+
   if (ids.length === 0) {
-    throw new Response(`Select at least one ${normalizedMode.slice(0, -1)}.`, {
-      status: 400,
-    });
+    throw new Response(`Select at least one ${normalizedMode.slice(0, -1)}.`, { status: 400 });
   }
- 
   return {
     mode: normalizedMode,
     resources: ids.map((id, i) => ({ id, title: titles[i] || id })),
@@ -1544,49 +1383,33 @@ function normalizeAppliesTo(mode, idsCsv, titlesDelimited) {
 
 function normalizeMinimumRequirement(mode, value) {
   const normalizedMode = mode?.toString().trim() || "none";
-
   if (!["none", "quantity", "amount"].includes(normalizedMode)) {
     throw new Response("Invalid minimum requirement selection.", { status: 400 });
   }
-
-  if (normalizedMode === "none") {
-    return { mode: "none", value: null };
-  }
+  if (normalizedMode === "none") return { mode: "none", value: null };
 
   const numericValue = Number(value);
-
   if (!Number.isFinite(numericValue) || numericValue <= 0) {
-    throw new Response("Minimum requirement value must be greater than 0.", {
-      status: 400,
-    });
+    throw new Response("Minimum requirement value must be greater than 0.", { status: 400 });
   }
-
   return { mode: normalizedMode, value: numericValue };
 }
 
 function normalizeCustomerEligibility(mode, segmentIdsCsv, customerIdsCsv) {
   const normalizedMode = mode?.toString().trim() || "all";
-
   if (!["all", "segments", "customers"].includes(normalizedMode)) {
     throw new Response("Invalid customer eligibility selection.", { status: 400 });
   }
-
   if (normalizedMode === "segments") {
     const segmentIds = (segmentIdsCsv?.toString() || "").split(",").filter(Boolean);
-    if (segmentIds.length === 0) {
-      throw new Response("Select at least one customer segment.", { status: 400 });
-    }
+    if (segmentIds.length === 0) throw new Response("Select at least one customer segment.", { status: 400 });
     return { mode: "segments", segmentIds, customerIds: [] };
   }
-
   if (normalizedMode === "customers") {
     const customerIds = (customerIdsCsv?.toString() || "").split(",").filter(Boolean);
-    if (customerIds.length === 0) {
-      throw new Response("Select at least one customer.", { status: 400 });
-    }
+    if (customerIds.length === 0) throw new Response("Select at least one customer.", { status: 400 });
     return { mode: "customers", segmentIds: [], customerIds };
   }
-
   return { mode: "all", segmentIds: [], customerIds: [] };
 }
 
@@ -1602,85 +1425,37 @@ function toFunctionDiscount(discount) {
   };
 }
 
-function formatActionCoupon(codeAppDiscount, discountConfig) {
-  return {
-    id: codeAppDiscount.discountId,
-    code: codeAppDiscount.codes.nodes[0]?.code || discountConfig.code,
-    title: codeAppDiscount.title,
-    status: codeAppDiscount.status,
-    startsAt: discountConfig.startsAt,
-    endsAt: codeAppDiscount.endsAt || discountConfig.endsAt,
-    usageLimit: codeAppDiscount.usageLimit || discountConfig.usageLimit,
-    appliesOncePerCustomer:
-      codeAppDiscount.appliesOncePerCustomer ?? discountConfig.appliesOncePerCustomer,
-    combinesWith: codeAppDiscount.combinesWith || discountConfig.combinesWith,
-    discountType: discountConfig.discountType,
-    discountValue: discountConfig.discountValue,
-    maxDiscountAmount: discountConfig.maxDiscountAmount,
-    appliesTo: discountConfig.appliesTo,
-    minimumRequirement: discountConfig.minimumRequirement,
-    customerEligibility: discountConfig.customerEligibility,
-    appliesOnOneTimePurchase:
-      codeAppDiscount.appliesOnOneTimePurchase ?? discountConfig.appliesOnOneTimePurchase,
-    appliesOnSubscription:
-      codeAppDiscount.appliesOnSubscription ?? discountConfig.appliesOnSubscription,
-    recurringCycleLimit:
-      codeAppDiscount.recurringCycleLimit ?? discountConfig.recurringCycleLimit,
-    tags: codeAppDiscount.tags || discountConfig.tags,
-  };
-}
-
 function normalizeUsageLimit(value) {
   const rawValue = value?.toString().trim();
-
-  if (!rawValue) {
-    return null;
-  }
-
+  if (!rawValue) return null;
   const usageLimit = Number(rawValue);
-
   if (!Number.isInteger(usageLimit) || usageLimit <= 0) {
-    throw new Response("Usage limit must be a positive whole number.", {
-      status: 400,
-    });
+    throw new Response("Usage limit must be a positive whole number.", { status: 400 });
   }
-
   return usageLimit;
 }
 
 function normalizeStartDateTime(dateValue, timeValue) {
   const rawDate = dateValue?.toString().trim();
-
-  if (!rawDate) {
-    return null;
-  }
-
+  if (!rawDate) return null;
   const time = timeValue?.toString().trim() || "00:00";
   return new Date(`${rawDate}T${time}:00.000Z`).toISOString();
 }
 
 function normalizeEndDateTime(dateValue, timeValue) {
   const rawDate = dateValue?.toString().trim();
-
-  if (!rawDate) {
-    return null;
-  }
-
+  if (!rawDate) return null;
   const time = timeValue?.toString().trim() || "23:59";
   return new Date(`${rawDate}T${time}:59.000Z`).toISOString();
 }
 
 function requiredString(formData, key) {
   const value = formData.get(key)?.toString().trim();
-
-  if (!value) {
-    throw new Response(`${key} is required`, { status: 400 });
-  }
-
+  if (!value) throw new Response(`${key} is required`, { status: 400 });
   return value;
 }
 
-function createInitialFormData(editingBatch) {
+function createInitialFormData(editingBatch, editingCustomerLabels = []) {
   if (editingBatch) {
     const t = editingBatch.template || {};
     return {
@@ -1700,10 +1475,6 @@ function createInitialFormData(editingBatch) {
         productDiscounts: t.combinesWith?.productDiscounts ?? true,
         shippingDiscounts: t.combinesWith?.shippingDiscounts ?? true,
       },
-      // Resource titles aren't stored in the template (only IDs), so the
-      // "Browse products/collections" picker will show a count but not
-      // titles until the user re-opens the picker — acceptable trade-off
-      // for avoiding a live lookup on every page load.
       appliesTo: {
         mode: t.appliesTo?.mode || "all",
         resources: t.appliesTo?.resources || [],
@@ -1716,13 +1487,14 @@ function createInitialFormData(editingBatch) {
         mode: t.customerEligibility?.mode || "all",
         segmentIds: t.customerEligibility?.segmentIds || [],
         customerIds: t.customerEligibility?.customerIds || [],
-        customerLabels: [],
+        customerLabels: editingCustomerLabels,
       },
-      purchaseType: t.appliesOnSubscription && t.appliesOnOneTimePurchase
-        ? "both"
-        : t.appliesOnSubscription
-          ? "subscription"
-          : "one_time",
+      purchaseType:
+        t.appliesOnSubscription && t.appliesOnOneTimePurchase
+          ? "both"
+          : t.appliesOnSubscription
+            ? "subscription"
+            : "one_time",
       recurringPaymentLimit: {
         mode:
           t.recurringCycleLimit === 1
@@ -1768,16 +1540,12 @@ function createInitialFormData(editingBatch) {
 }
 
 function formatDateForInput(value) {
-  if (!value) {
-    return "";
-  }
+  if (!value) return "";
   return value.slice(0, 10);
 }
 
 function formatTimeForInput(value) {
-  if (!value) {
-    return "";
-  }
+  if (!value) return "";
   return value.slice(11, 16);
 }
 

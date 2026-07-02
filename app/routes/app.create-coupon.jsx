@@ -453,6 +453,18 @@ export default function Index() {
   const createdDiscount = fetcher.data?.discount || createdDiscounts[0];
   const errors = fetcher.data?.errors || [];
 
+  const [codeValidation, setCodeValidation] = useState({});
+
+  // Add this validation function in the component
+  const validateCode = (rowId, code) => {
+    const validation = validateCouponCode(code);
+    setCodeValidation(prev => ({
+      ...prev,
+      [rowId]: validation
+    }));
+    return validation.valid;
+  };
+
   useEffect(() => {
     if (createdDiscount?.id) {
       const message = fetcher.data?.intent === "update"
@@ -631,8 +643,16 @@ export default function Index() {
                       name={`discounts[${index}][code]`}
                       placeholder="SAVE10"
                       value={row.code}
-                      onChange={(e) => updateDiscountRow(row.id, { code: e.target.value })}
+                      onChange={(e) => {
+                        const newCode = e.target.value.toUpperCase();
+                        updateDiscountRow(row.id, { code: newCode });
+                        validateCode(row.id, newCode);
+                      }}
                       required
+                      {...(codeValidation[row.id] && !codeValidation[row.id].valid && {
+                        tone: "critical",
+                        helpText: codeValidation[row.id].message
+                      })}
                     />
 
                     {/* --- Value --- */}
@@ -670,7 +690,7 @@ export default function Index() {
                       )}
                     </s-stack>
 
-                    {row.discountType !== "free_shipping" && (
+                    {row.discountType === "percentage" && (
                       <s-money-field
                         label="Maximum discount amount"
                         name={`discounts[${index}][maxDiscountAmount]`}
@@ -1154,6 +1174,32 @@ export default function Index() {
   );
 }
 
+// Add this validation function
+function validateCouponCode(code) {
+  if (!code || code.trim().length === 0) {
+    return { valid: false, message: "Coupon code is required" };
+  }
+  
+  const trimmedCode = code.trim().toUpperCase();
+  
+  // Check length (Shopify typically requires 3-30 characters)
+  if (trimmedCode.length < 3) {
+    return { valid: false, message: "Coupon code must be at least 3 characters" };
+  }
+  
+  if (trimmedCode.length > 30) {
+    return { valid: false, message: "Coupon code must be less than 30 characters" };
+  }
+  
+  // Check for valid characters (letters, numbers, underscores, hyphens)
+  if (!/^[A-Z0-9_-]+$/.test(trimmedCode)) {
+    return { valid: false, message: "Coupon code can only contain letters, numbers, underscores, and hyphens" };
+  }
+  
+  return { valid: true, message: "" };
+}
+
+
 function findDefaultFunction(functions) {
   return (
     functions.find((shopifyFunction) =>
@@ -1210,11 +1256,16 @@ function normalizeDiscount(rawDiscount, label) {
   const isFreeShipping = discountType === "free_shipping";
 
   const discountValue = isFreeShipping ? 0 : Number(rawDiscount.discountValue);
-  const maxDiscountAmount = isFreeShipping ? null : Number(rawDiscount.maxDiscountAmount);
 
   const usageLimit = normalizeUsageLimit(rawDiscount.usageLimit, label);
   const startsAt = normalizeStartDateTime(rawDiscount.startsAtDate, rawDiscount.startsAtTime);
   const endsAt = normalizeEndDateTime(rawDiscount.endsAt, rawDiscount.endsAtTime);
+
+  // Validate the code format
+  const validation = validateCouponCode(code);
+  if (!validation.valid) {
+    throw new Response(`${label}: ${validation.message}`, { status: 400 });
+  }
 
   if (!code) {
     throw new Response(`${label}: code is required.`, { status: 400 });
@@ -1224,6 +1275,11 @@ function normalizeDiscount(rawDiscount, label) {
     throw new Response(`${label}: choose percentage, fixed, or free shipping.`, {
       status: 400,
     });
+  }
+
+  let maxDiscountAmount = null;
+  if (!isFreeShipping && rawDiscount.maxDiscountAmount) {
+    maxDiscountAmount = Number(rawDiscount.maxDiscountAmount);
   }
 
   if (!isFreeShipping) {
@@ -1239,7 +1295,7 @@ function normalizeDiscount(rawDiscount, label) {
       });
     }
 
-    if (!Number.isFinite(maxDiscountAmount) || maxDiscountAmount <= 0) {
+    if (maxDiscountAmount !== null && (!Number.isFinite(maxDiscountAmount) || maxDiscountAmount <= 0)) {
       throw new Response(`${label}: maxDiscountAmount must be greater than 0.`, {
         status: 400,
       });

@@ -5,12 +5,13 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import {
   reconcileBatchRegistry,
-  fetchLiveDiscounts,
+  fetchLiveMasters,
+  fetchLiveCodesForBatch,
   deleteBatch,
   generateCSVFromLiveDiscounts,
 } from "../models/bulkBatch.server";
 
-const PAGE_SIZE = 5;
+const PAGE_SIZE = 10;
 
 function downloadCSV(csv, filename) {
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
@@ -58,11 +59,15 @@ export const loader = async ({ request }) => {
 
   const responseJson = await response.json();
   const batches = await reconcileBatchRegistry(admin);
-  const bulkDiscountIds = new Set(batches.flatMap((b) => b.discountIds));
+
+  // Each batch now corresponds to exactly ONE master DiscountCodeNode, so
+  // excluding bulk-batch discounts from the single-coupon list is a flat
+  // map rather than the old flatMap over N discountIds per batch.
+  const bulkMasterIds = new Set(batches.map((b) => b.masterDiscountId));
 
   const coupons = formatCoupons(
     responseJson.data.discountNodes.nodes.filter(
-      (node) => !bulkDiscountIds.has(node.id)
+      (node) => !bulkMasterIds.has(node.id)
     )
   );
 
@@ -126,16 +131,23 @@ export const action = async ({ request }) => {
   if (intent === "bulkDeleteBatches") {
     const ids = formData.get("batchIds")?.toString().split(",").filter(Boolean) || [];
     const errors = [];
-  
-    const BATCH_DELETE_CONCURRENCY = 2; // each deleteBatch() already runs 8-wide internally
-  
+
+    // Under the master-discount model, deleteBatch() is a single
+    // discountCodeDelete mutation per batch (not a loop over N coupon
+    // GIDs) — that's what eliminated the old Cloudflare 524 risk on this
+    // path entirely. A small concurrency cap here is just good manners
+    // toward Shopify's rate limits when deleting many batches at once,
+    // not a workaround for per-batch cost the way the old comment
+    // implied.
+    const BATCH_DELETE_CONCURRENCY = 4;
+
     for (let i = 0; i < ids.length; i += BATCH_DELETE_CONCURRENCY) {
       const chunk = ids.slice(i, i + BATCH_DELETE_CONCURRENCY);
-  
+
       const results = await Promise.allSettled(
         chunk.map((batchId) => deleteBatch(admin, batchId)),
       );
-  
+
       results.forEach((result, idx) => {
         if (result.status === "fulfilled" && result.value.errors?.length) {
           errors.push(...result.value.errors);
@@ -144,7 +156,7 @@ export const action = async ({ request }) => {
         }
       });
     }
-  
+
     return { intent: "bulkDeleteBatches", errors };
   }
 
@@ -153,8 +165,18 @@ export const action = async ({ request }) => {
     const batches = await reconcileBatchRegistry(admin);
     const batch = batches.find((b) => b.batchId === batchId);
     if (!batch) throw new Response("Batch not found.", { status: 404 });
-    const liveDiscounts = await fetchLiveDiscounts(admin, batch.discountIds);
-    const csvContent = generateCSVFromLiveDiscounts(batch, liveDiscounts);
+
+    // Export always reflects current reality: fresh status straight from
+    // the master discount, and the full live code list paginated off its
+    // codes connection — never the registry's cached couponCodes/count,
+    // which can drift if codes were ever touched outside the app.
+    const [liveMasters, liveCodes] = await Promise.all([
+      fetchLiveMasters(admin, [batch.masterDiscountId]),
+      fetchLiveCodesForBatch(admin, batch.masterDiscountId),
+    ]);
+    const liveStatus = liveMasters[0]?.status || null;
+
+    const csvContent = generateCSVFromLiveDiscounts(batch, liveCodes, liveStatus);
     return {
       intent: "exportBatch",
       csvContent,
@@ -181,7 +203,7 @@ export default function Dashboard() {
 
   // ── Tab state ─────────────────────────────────────────────────────────────
   // 0 = Discount Coupons (default), 1 = Bulk Discount Batches
-  const [activeTab, setActiveTab] = useState(0);
+  const [activeTab, setActiveTab] = useState(1);
 
   // ── Coupon table state ────────────────────────────────────────────────────
   const [couponSearch, setCouponSearch] = useState("");
@@ -444,6 +466,25 @@ export default function Dashboard() {
         <button
           type="button"
           role="tab"
+          aria-selected={activeTab === 1}
+          onClick={() => setActiveTab(1)}
+          style={{
+            appearance: "none",
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            padding: "10px 4px",
+            fontSize: "14px",
+            fontWeight: activeTab === 1 ? 600 : 400,
+            color: activeTab === 1 ? "var(--p-color-text, #1a1a1a)" : "var(--p-color-text-subdued, #6b6b6b)",
+            borderBottom: activeTab === 1 ? "2px solid var(--p-color-border-emphasis, #1a1a1a)" : "2px solid transparent",
+          }}
+        >
+          Bulk Discount Batches{batches.length ? ` (${batches.length})` : ""}
+        </button>
+        <button
+          type="button"
+          role="tab"
           aria-selected={activeTab === 0}
           onClick={() => setActiveTab(0)}
           style={{
@@ -461,26 +502,161 @@ export default function Dashboard() {
         >
           Discount Coupons{coupons.length ? ` (${coupons.length})` : ""}
         </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 1}
-          onClick={() => setActiveTab(1)}
-          style={{
-            appearance: "none",
-            background: "none",
-            border: "none",
-            cursor: "pointer",
-            padding: "10px 4px",
-            fontSize: "14px",
-            fontWeight: activeTab === 1 ? 600 : 400,
-            color: activeTab === 1 ? "var(--p-color-text, #1a1a1a)" : "var(--p-color-text-subdued, #6b6b6b)",
-            borderBottom: activeTab === 1 ? "2px solid var(--p-color-border-emphasis, #1a1a1a)" : "2px solid transparent",
-          }}
-        >
-          Bulk Discount Batches{batches.length ? ` (${batches.length})` : ""}
-        </button>
       </div>
+
+      {/* ── Bulk Discount Batches ───────────────────────────────────────── */}
+      {activeTab === 1 && (
+        <s-section>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+            <s-text variant="headingMd">Bulk Discount Batches</s-text>
+            <s-stack direction="inline" gap="base">
+              {selectedBatches.size > 0 && (
+                <s-button
+                  variant="secondary"
+                  tone="critical"
+                  disabled={isBusy}
+                  onClick={requestBulkDeleteBatches}
+                >
+                  Delete selected ({selectedBatches.size})
+                </s-button>
+              )}
+              <Link to="/app/bulk-discount">
+                <s-button variant="primary">Create Batch</s-button>
+              </Link>
+            </s-stack>
+          </div>
+
+          {batches.length === 0 ? (
+            <s-banner heading="No bulk batches yet">
+              <s-text>Generate a batch of coupons using the button above.</s-text>
+            </s-banner>
+          ) : (
+            <s-table
+              paginate={filteredBatches.length > PAGE_SIZE}
+              hasPreviousPage={batchPage > 0}
+              hasNextPage={batchPage < batchTotalPages - 1}
+              onNextpage={() => setBatchPage((p) => p + 1)}
+              onPreviouspage={() => setBatchPage((p) => p - 1)}
+              loading={isBusy && pendingAction !== "export"}
+            >
+              {/* Search filter slot */}
+              <s-search-field
+                slot="filters"
+                label="Search batches"
+                labelAccessibilityVisibility="exclusive"
+                placeholder="Search by name or prefix..."
+                onInput={(e) => setBatchSearch(e.target.value)}
+              />
+
+              <s-table-header-row>
+                <s-table-header>
+                  <s-checkbox
+                    checked={
+                      paginatedBatches.length > 0 &&
+                      selectedBatches.size === paginatedBatches.length
+                    }
+                    onChange={toggleAllBatches}
+                    label="Select all"
+                    labelAccessibilityVisibility="exclusive"
+                  />
+                </s-table-header>
+                <s-table-header
+                  listSlot="primary"
+                  style={{ cursor: "pointer" }}
+                  onClick={() => toggleSort(batchSort, setBatchSort, "name")}
+                >
+                  Name{sortIcon(batchSort, "name")}
+                </s-table-header>
+                <s-table-header
+                  listSlot="labeled"
+                  style={{ cursor: "pointer" }}
+                  onClick={() => toggleSort(batchSort, setBatchSort, "createdAt")}
+                >
+                  Created{sortIcon(batchSort, "createdAt")}
+                </s-table-header>
+                <s-table-header listSlot="labeled" format="numeric">Coupons</s-table-header>
+                <s-table-header listSlot="labeled">Prefix</s-table-header>
+                <s-table-header listSlot="labeled">Value</s-table-header>
+                <s-table-header listSlot="labeled" format="currency">Max Cap</s-table-header>
+                <s-table-header listSlot="labeled">Actions</s-table-header>
+              </s-table-header-row>
+
+              <s-table-body>
+                {paginatedBatches.length === 0 ? (
+                  <s-table-row>
+                    <s-table-cell>No batches match your search.</s-table-cell>
+                    <s-table-cell></s-table-cell>
+                    <s-table-cell></s-table-cell>
+                    <s-table-cell></s-table-cell>
+                    <s-table-cell></s-table-cell>
+                    <s-table-cell></s-table-cell>
+                    <s-table-cell></s-table-cell>
+                  </s-table-row>
+                ) : (
+                  paginatedBatches.map((batch) => {
+                    const isExporting =
+                      isBusy && pendingBatchId === batch.batchId && pendingAction === "export";
+                    const isDeleting =
+                      isBusy && pendingBatchId === batch.batchId && pendingAction === "delete";
+                    return (
+                      <s-table-row key={batch.batchId}>
+                        <s-table-cell>
+                          <s-checkbox
+                            checked={selectedBatches.has(batch.batchId)}
+                            onChange={() => toggleBatch(batch.batchId)}
+                            label={`Select ${batch.name}`}
+                            labelAccessibilityVisibility="exclusive"
+                          />
+                        </s-table-cell>
+                        <s-table-cell>{batch.name}</s-table-cell>
+                        <s-table-cell>
+                          {new Date(batch.createdAt).toLocaleDateString()}
+                        </s-table-cell>
+                        <s-table-cell>{batch.count}</s-table-cell>
+                        <s-table-cell>{batch.prefix || "—"}</s-table-cell>
+                        <s-table-cell>{formatBatchValue(batch.template)}</s-table-cell>
+                        <s-table-cell>{formatBatchMaxCap(batch.template)}</s-table-cell>
+                        <s-table-cell>
+                          <s-stack direction="inline" gap="base">
+                            <s-button
+                              variant="secondary"
+                              disabled={isBusy && !isExporting}
+                              {...(isExporting ? { loading: true } : {})}
+                              onClick={() => handleExport(batch.batchId)}
+                            >
+                              Export
+                            </s-button>
+                            <Link to={`/app/bulk-discount?batchId=${batch.batchId}`}>
+                              <s-button variant="secondary" disabled={isBusy}>Edit</s-button>
+                            </Link>
+                            <s-button
+                              variant="secondary"
+                              tone="critical"
+                              disabled={isBusy && !isDeleting}
+                              {...(isDeleting ? { loading: true } : {})}
+                              onClick={() => requestDeleteBatch(batch.batchId, batch.name)}
+                            >
+                              Delete
+                            </s-button>
+                          </s-stack>
+                        </s-table-cell>
+                      </s-table-row>
+                    );
+                  })
+                )}
+              </s-table-body>
+            </s-table>
+          )}
+
+          {filteredBatches.length > PAGE_SIZE && (
+            <div style={{ marginTop: "8px" }}>
+              <s-text tone="subdued" variant="bodySm">
+                Showing {batchPage * PAGE_SIZE + 1}–{Math.min((batchPage + 1) * PAGE_SIZE, filteredBatches.length)} of {filteredBatches.length} batches
+              </s-text>
+            </div>
+          )}
+        </s-section>
+      )}
 
       {/* ── Discount Coupons ────────────────────────────────────────── */}
       {activeTab === 0 && (
@@ -501,11 +677,6 @@ export default function Dashboard() {
               <Link to="/app/create-coupon">
                 <s-button variant="primary">Create Coupon</s-button>
               </Link>
-              {coupons.length > PAGE_SIZE && (
-                <Link to="/app/discounts">
-                  <s-button variant="secondary">View All ({coupons.length})</s-button>
-                </Link>
-              )}
             </s-stack>
           </div>
 
@@ -655,162 +826,6 @@ export default function Dashboard() {
             <div style={{ marginTop: "8px" }}>
               <s-text tone="subdued" variant="bodySm">
                 Showing {couponPage * PAGE_SIZE + 1}–{Math.min((couponPage + 1) * PAGE_SIZE, filteredCoupons.length)} of {filteredCoupons.length} coupons
-              </s-text>
-            </div>
-          )}
-        </s-section>
-      )}
-
-      {/* ── Bulk Discount Batches ───────────────────────────────────────── */}
-      {activeTab === 1 && (
-        <s-section>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-            <s-text variant="headingMd">Bulk Discount Batches</s-text>
-            <s-stack direction="inline" gap="base">
-              {selectedBatches.size > 0 && (
-                <s-button
-                  variant="secondary"
-                  tone="critical"
-                  disabled={isBusy}
-                  onClick={requestBulkDeleteBatches}
-                >
-                  Delete selected ({selectedBatches.size})
-                </s-button>
-              )}
-              <Link to="/app/bulk-discount">
-                <s-button variant="primary">Create Batch</s-button>
-              </Link>
-              {batches.length > PAGE_SIZE && (
-                <Link to="/app/bulk-discount-sets">
-                  <s-button variant="secondary">View All ({batches.length})</s-button>
-                </Link>
-              )}
-            </s-stack>
-          </div>
-
-          {batches.length === 0 ? (
-            <s-banner heading="No bulk batches yet">
-              <s-text>Generate a batch of coupons using the button above.</s-text>
-            </s-banner>
-          ) : (
-            <s-table
-              paginate={filteredBatches.length > PAGE_SIZE}
-              hasPreviousPage={batchPage > 0}
-              hasNextPage={batchPage < batchTotalPages - 1}
-              onNextpage={() => setBatchPage((p) => p + 1)}
-              onPreviouspage={() => setBatchPage((p) => p - 1)}
-              loading={isBusy && pendingAction !== "export"}
-            >
-              {/* Search filter slot */}
-              <s-search-field
-                slot="filters"
-                label="Search batches"
-                labelAccessibilityVisibility="exclusive"
-                placeholder="Search by name or prefix..."
-                onInput={(e) => setBatchSearch(e.target.value)}
-              />
-
-              <s-table-header-row>
-                <s-table-header>
-                  <s-checkbox
-                    checked={
-                      paginatedBatches.length > 0 &&
-                      selectedBatches.size === paginatedBatches.length
-                    }
-                    onChange={toggleAllBatches}
-                    label="Select all"
-                    labelAccessibilityVisibility="exclusive"
-                  />
-                </s-table-header>
-                <s-table-header
-                  listSlot="primary"
-                  style={{ cursor: "pointer" }}
-                  onClick={() => toggleSort(batchSort, setBatchSort, "name")}
-                >
-                  Name{sortIcon(batchSort, "name")}
-                </s-table-header>
-                <s-table-header
-                  listSlot="labeled"
-                  style={{ cursor: "pointer" }}
-                  onClick={() => toggleSort(batchSort, setBatchSort, "createdAt")}
-                >
-                  Created{sortIcon(batchSort, "createdAt")}
-                </s-table-header>
-                <s-table-header listSlot="labeled" format="numeric">Coupons</s-table-header>
-                <s-table-header listSlot="labeled">Prefix</s-table-header>
-                <s-table-header listSlot="labeled">Value</s-table-header>
-                <s-table-header listSlot="labeled">Actions</s-table-header>
-              </s-table-header-row>
-
-              <s-table-body>
-                {paginatedBatches.length === 0 ? (
-                  <s-table-row>
-                    <s-table-cell>No batches match your search.</s-table-cell>
-                    <s-table-cell></s-table-cell>
-                    <s-table-cell></s-table-cell>
-                    <s-table-cell></s-table-cell>
-                    <s-table-cell></s-table-cell>
-                    <s-table-cell></s-table-cell>
-                  </s-table-row>
-                ) : (
-                  paginatedBatches.map((batch) => {
-                    const isExporting =
-                      isBusy && pendingBatchId === batch.batchId && pendingAction === "export";
-                    const isDeleting =
-                      isBusy && pendingBatchId === batch.batchId && pendingAction === "delete";
-                    return (
-                      <s-table-row key={batch.batchId}>
-                        <s-table-cell>
-                          <s-checkbox
-                            checked={selectedBatches.has(batch.batchId)}
-                            onChange={() => toggleBatch(batch.batchId)}
-                            label={`Select ${batch.name}`}
-                            labelAccessibilityVisibility="exclusive"
-                          />
-                        </s-table-cell>
-                        <s-table-cell>{batch.name}</s-table-cell>
-                        <s-table-cell>
-                          {new Date(batch.createdAt).toLocaleDateString()}
-                        </s-table-cell>
-                        <s-table-cell>{batch.count}</s-table-cell>
-                        <s-table-cell>{batch.prefix || "—"}</s-table-cell>
-                        <s-table-cell>{formatBatchValue(batch.template)}</s-table-cell>
-                        <s-table-cell>
-                          <s-stack direction="inline" gap="base">
-                            <s-button
-                              variant="secondary"
-                              disabled={isBusy && !isExporting}
-                              {...(isExporting ? { loading: true } : {})}
-                              onClick={() => handleExport(batch.batchId)}
-                            >
-                              Export
-                            </s-button>
-                            <Link to={`/app/bulk-discount?batchId=${batch.batchId}`}>
-                              <s-button variant="secondary" disabled={isBusy}>Edit</s-button>
-                            </Link>
-                            <s-button
-                              variant="secondary"
-                              tone="critical"
-                              disabled={isBusy && !isDeleting}
-                              {...(isDeleting ? { loading: true } : {})}
-                              onClick={() => requestDeleteBatch(batch.batchId, batch.name)}
-                            >
-                              Delete
-                            </s-button>
-                          </s-stack>
-                        </s-table-cell>
-                      </s-table-row>
-                    );
-                  })
-                )}
-              </s-table-body>
-            </s-table>
-          )}
-
-          {filteredBatches.length > PAGE_SIZE && (
-            <div style={{ marginTop: "8px" }}>
-              <s-text tone="subdued" variant="bodySm">
-                Showing {batchPage * PAGE_SIZE + 1}–{Math.min((batchPage + 1) * PAGE_SIZE, filteredBatches.length)} of {filteredBatches.length} batches
               </s-text>
             </div>
           )}
@@ -1000,6 +1015,19 @@ function formatBatchValue(template) {
   if (template.discountType === "percentage") return `${template.discountValue}%`;
   if (template.discountType === "fixed") return `$${template.discountValue}`;
   return "—";
+}
+
+// Separate column from formatBatchValue on purpose — the discount % or
+// flat amount and its cap are two different numbers a merchant scans for
+// independently in this table, so collapsing them into one string (e.g.
+// "15% (capped at $500)") made the column harder to scan at a glance.
+function formatBatchMaxCap(template) {
+  if (!template) return "—";
+  if (template.discountType === "free_shipping") return "—";
+  if (template.maxDiscountAmount === null || template.maxDiscountAmount === undefined || template.maxDiscountAmount === "") {
+    return "—";
+  }
+  return `$${template.maxDiscountAmount}`;
 }
 
 export const headers = (headersArgs) => {

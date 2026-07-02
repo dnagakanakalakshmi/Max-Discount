@@ -26,6 +26,14 @@
 // The /progress route treats a missing entry as "still processing"
 // rather than an error, so the polling UI doesn't break; it just won't
 // show numeric progress for that case.
+//
+// csvContent IS stored here transiently — set on the job entry just
+// before completeJob() is called, read once by the progress poller via
+// getCsvContent(), and eligible for pruning after that. It is NOT stored
+// in the metafield registry (too large) and NOT kept in memory
+// indefinitely (pruneCompletedJobs handles cleanup). This is the only
+// place the CSV lives between "generation finished" and "client polled
+// and downloaded it".
 
 const jobs = new Map();
 
@@ -57,15 +65,25 @@ export function updateJobProgress(batchId, { completed, newErrors = [] }) {
 }
 
 /**
- * Call once when the job finishes (success or otherwise).
+ * Store the CSV transiently on the job so the progress poller can pick
+ * it up once. Call this BEFORE completeJob so the poller sees both
+ * status=complete and csvContent in the same response.
  */
-export function completeJob(batchId, { csvContent }) {
+export function setJobCsv(batchId, csvContent) {
+  const job = jobs.get(batchId);
+  if (!job) return;
+  job.csvContent = csvContent;
+}
+
+/**
+ * Call once when the job finishes successfully.
+ */
+export function completeJob(batchId) {
   const job = jobs.get(batchId);
   if (!job) return;
 
   job.status = "complete";
   job.completed = job.total;
-  job.csvContent = csvContent;
 }
 
 export function failJob(batchId, errorMessage) {
@@ -93,6 +111,11 @@ export function getProgress(batchId) {
   };
 }
 
+/**
+ * Returns the transiently-stored CSV for a completed job, or null if it
+ * hasn't been set yet / job doesn't exist. The progress route calls this
+ * once when status=complete and delivers it to the client for download.
+ */
 export function getCsvContent(batchId) {
   return jobs.get(batchId)?.csvContent || null;
 }
@@ -102,7 +125,8 @@ export function getCsvContent(batchId) {
  * Map doesn't grow unbounded over the life of the process. Not critical
  * at typical usage volumes, but cheap to do. Call this periodically if
  * you want (e.g. from a setInterval in shopify.server.js), or just leave
- * it — even a few thousand completed entries is a trivial amount of memory.
+ * it — even a few thousand completed entries is a trivial amount of memory
+ * once the CSV strings are no longer referenced.
  */
 export function pruneCompletedJobs(olderThanMs = 30 * 60 * 1000) {
   const now = Date.now();

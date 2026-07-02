@@ -1,5 +1,26 @@
-query DeliveryInput {
+query DeliveryInput($collectionIds: [ID!]) {
   cart {
+    cost{
+      subtotalAmount{
+        amount
+      }
+    }
+    lines{
+      quantity
+      cost{
+        subtotalAmount{
+          amount
+        }
+      }
+      merchandise{
+        ... on ProductVariant{
+          product{
+            id
+            inAnyCollection(ids: $collectionIds)
+          }
+        }
+      }
+    }
     deliveryGroups {
       id
     }
